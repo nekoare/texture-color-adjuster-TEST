@@ -1,0 +1,38 @@
+{
+  "name": "dev.nekoare.tex-col-adjuster-test",
+  "displayName": "Texture Color Adjuster TEST",
+  "version": "1.2",
+  "unity": "2022.3",
+  "unityRelease": "0f1",
+  "description": "Unity Editor extension for advanced texture color adjustment with support for various color spaces and intelligent color manipulation algorithms.",
+  "keywords": [
+    "texture",
+    "color",
+    "adjustment",
+    "unity",
+    "editor",
+    "image processing",
+    "color matching",
+    "lab color space"
+  ],
+  "author": {
+    "name": "nekoare",
+    "url": "https://github.com/nekoare"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nekoare/texture-color-adjuster-TEST.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nekoare/texture-color-adjuster-TEST/issues"
+  },
+  "homepage": "https://github.com/nekoare/texture-color-adjuster-TEST#readme",
+  "dependencies": {},
+  "vpmDependencies": {
+    "com.vrchat.avatars": "3.5.0"
+  },
+  "changelogUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/CHANGELOG.md",
+  "documentationUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/README.md",
+  "licensesUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/LICENSE"
+}
