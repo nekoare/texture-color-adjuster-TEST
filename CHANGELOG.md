@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 更新履歴
 
+### 1.3.0
+- NDMF（Non-Destructive Modular Framework）統合機能の追加
+- Runtimeコンポーネント機能の追加（ゲームオブジェクトにアタッチ可能）
+- GPU処理サポートによるパフォーマンス向上
+- リアルタイムプレビュー機能の強化
+- 色空間変換ユーティリティの追加
+- エディタ機能の拡張（コンポーネントエディタ、カスタムインスペクタ）
+- NDMF依存関係の追加（nadena.dev.ndmf >= 1.4.0）
+- VRChat Avatars依存バージョンの更新（>= 3.7.0）
+
 ### 1.2
 - シェーダー設定転送タブのMaterialUnifyTool同等機能を完成
 - コンパイルエラーの解消
@@ -29,6 +39,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - VCCリポジトリ対応
 - 高度な色調整機能の実装
 - 日本語・英語対応
+
+---
+
+## [1.3.0] - 2025-01-16
+
+### Added
+- NDMF (Non-Destructive Modular Framework) integration support
+- Runtime component functionality (attachable to game objects)
+- GPU processing support for improved performance
+- Enhanced real-time preview capabilities
+- Color space conversion utilities (TextureColorSpaceUtility)
+- Extended editor functionality (Component Editor, Custom Inspector)
+- New NDMF-related classes:
+  - TexColorAdjusterPlugin: NDMF plugin integration
+  - TexColorAdjusterPreview: Real-time preview in NDMF
+  - TextureAdjustmentPass: NDMF build-time processing
+  - NDMFIntegrationHelper: Helper for NDMF integration
+- Runtime components:
+  - ColorAdjustmentMode: Color adjustment mode enumeration
+  - TextureColorAdjustmentComponent: Runtime component for texture adjustment
+
+### Changed
+- Updated VRChat Avatars dependency to >= 3.7.0
+- Added NDMF dependency (nadena.dev.ndmf >= 1.4.0)
+- Enhanced texture processing with GPU acceleration
+- Improved preview management system
+
+### Technical
+- Added Assembly Definition files for Editor and Runtime
+- Implemented ExtendedRenderTexture for advanced rendering
+- Enhanced color adjustment algorithms with GPU support
 
 ---
 

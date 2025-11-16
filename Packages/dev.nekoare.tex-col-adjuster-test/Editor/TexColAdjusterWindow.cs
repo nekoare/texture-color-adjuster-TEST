@@ -1,10 +1,12 @@
-using System;
+﻿using System;
 using TexColorAdjusterNamespace;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 using UnityEditor;
+using TexColAdjuster.Editor;
+using ColorAdjustmentMode = TexColAdjuster.Runtime.ColorAdjustmentMode;
 
 namespace TexColAdjuster
 {
@@ -12,7 +14,7 @@ namespace TexColAdjuster
     {
         private Vector2 scrollPosition;
         private int activeTab = 0;
-        private readonly string[] tabs = { "Basic", "Direct", "Color Change", "Color Adjust", "Shader Settings" };
+        private readonly string[] tabs = { "Basic", "Direct", "Color Change", "Shader Settings" };
         
         // Texture references
         private Texture2D referenceTexture;
@@ -30,6 +32,13 @@ namespace TexColAdjuster
         // UI state
         private bool showPreview = true;
         private bool realTimePreview = true;
+        private bool directTabAutoPreviewEnabled = true;
+        private bool directTabPreviewPending = false;
+        private bool directTabPreviewInFlight = false;
+        private bool directTabHasQueuedParameters = false;
+        private double directTabNextPreviewTime = 0d;
+        private DirectPreviewParameterState directTabQueuedParameterState;
+        private const double DirectTabPreviewDebounceSeconds = 0.2d;
         private bool isProcessing = false;
         private float processingProgress = 0f;
         
@@ -62,6 +71,10 @@ namespace TexColAdjuster
         private Vector2 targetTextureScrollPosition;
         private Vector2 referenceTextureScrollPosition;
         private float colorSelectionRange = 1.0f;
+        private Texture2D cachedTargetReadableForPicking;
+        private Texture2D cachedTargetReadableSource;
+        private Texture2D cachedReferenceReadableForPicking;
+        private Texture2D cachedReferenceReadableSource;
         
         // Legacy single texture variables
         private Texture2D singleTexture;
@@ -88,10 +101,14 @@ namespace TexColAdjuster
         
         // High-precision mode settings
         private bool useHighPrecisionMode = false;
+        private bool lastDirectTabHighPrecisionState = false;
         private HighPrecisionProcessor.HighPrecisionConfig highPrecisionConfig = new HighPrecisionProcessor.HighPrecisionConfig();
         private Texture2D highPrecisionPreviewTexture = null;
         private Texture2D uvMaskPreviewTexture = null;
         private string uvUsageStats = "";
+        
+        // NDMF integration
+        private bool useNDMFDirectMode = true;
         
         // Balance mode settings
         private bool useBalanceMode = true;
@@ -113,6 +130,8 @@ namespace TexColAdjuster
         private Color lastSelectedReferenceColor = Color.white;
         private bool lastHasSelectedTargetColor = false;
         private bool lastHasSelectedReferenceColor = false;
+        private float lastColorSelectionRange = -1f;
+        private bool lastUseHighPrecisionModeForPreview = false;
         
         // Presets
         private List<ColorAdjustmentPreset> presets = new List<ColorAdjustmentPreset>();
@@ -200,6 +219,13 @@ namespace TexColAdjuster
         private float exposure = 0.0f;
         private bool enableTransparency = false;
         private float transparency = 0.0f;
+
+        // Cached GUI styles
+        private GUIStyle largeBoldLabelStyle;
+        private GUIStyle largeToggleLabelStyle;
+
+        private static readonly Color DropLabelMissingColor = new Color(250f / 255f, 0f, 0f);
+        private static readonly Color DropLabelReadyColor = new Color(0f, 220f / 255f, 0f);
         
         [MenuItem("Tools/TexColAdjuster")]
         public static void ShowWindow()
@@ -212,10 +238,13 @@ namespace TexColAdjuster
         private void OnEnable()
         {
             LoadPresets();
+            useNDMFDirectMode = NDMFIntegrationHelper.GetNDMFMode("Direct");
         }
         
         private void OnDisable()
         {
+            CancelDirectTabAutoPreview();
+            DisposeReadableTextureCaches();
             ClearUVMaskPreview();
         }
         
@@ -242,32 +271,153 @@ namespace TexColAdjuster
                     GenerateSmartColorMatchPreview();
                     UpdateSmartColorMatchParameterCache();
                 }
-                else if (activeTab == 1 && CanProcess() && HasParametersChanged())
+                else if (activeTab == 1)
                 {
-                    if (useHighPrecisionMode)
-                    {
-                        GenerateHighPrecisionPreview();
-                    }
-                    else
-                    {
-                        GeneratePreview();
-                    }
-                    UpdateParameterCache();
-                }
-                else if (activeTab == 4 && CanProcessExperimental())
-                {
-                    if (useHighPrecisionMode && GetExperimentalReferenceTexture() != null)
-                    {
-                        GenerateHighPrecisionPreviewForDirectTab();
-                    }
-                    else
-                    {
-                        GenerateExperimentalPreview();
-                    }
+                    HandleDirectTabAutoPreview();
                 }
             }
         }
         
+        private void HandleDirectTabAutoPreview()
+        {
+            if (!directTabAutoPreviewEnabled)
+            {
+                CancelDirectTabAutoPreview(false);
+                return;
+            }
+
+            if (!CanProcessExperimental())
+            {
+                CancelDirectTabAutoPreview();
+                return;
+            }
+
+            if (useHighPrecisionMode && !IsHighPrecisionConfigValidForDirectTab())
+            {
+                CancelDirectTabAutoPreview();
+                return;
+            }
+
+            var currentState = CaptureCurrentDirectPreviewState();
+
+            if (HasParametersChanged())
+            {
+                RequestDirectTabAutoPreview(currentState);
+            }
+            else if (directTabHasQueuedParameters && !directTabQueuedParameterState.Equals(currentState))
+            {
+                RequestDirectTabAutoPreview(currentState);
+            }
+
+            TryExecuteDirectTabAutoPreview();
+        }
+
+        private void RequestDirectTabAutoPreview(DirectPreviewParameterState state)
+        {
+            double now = EditorApplication.timeSinceStartup;
+
+            if (!directTabPreviewPending || !directTabHasQueuedParameters || !directTabQueuedParameterState.Equals(state))
+            {
+                directTabNextPreviewTime = now + DirectTabPreviewDebounceSeconds;
+                directTabQueuedParameterState = state;
+                directTabHasQueuedParameters = true;
+            }
+
+            directTabPreviewPending = true;
+            Repaint();
+        }
+
+        private void TryExecuteDirectTabAutoPreview()
+        {
+            if (directTabPreviewInFlight || !directTabPreviewPending)
+                return;
+
+            if (EditorApplication.timeSinceStartup < directTabNextPreviewTime)
+                return;
+
+            if (!CanProcessExperimental())
+            {
+                CancelDirectTabAutoPreview();
+                return;
+            }
+
+            directTabPreviewPending = false;
+            directTabPreviewInFlight = true;
+
+            try
+            {
+                if (useHighPrecisionMode && IsHighPrecisionConfigValidForDirectTab())
+                {
+                    GenerateHighPrecisionPreviewForDirectTab();
+                }
+                else
+                {
+                    GenerateExperimentalPreview();
+                }
+            }
+            finally
+            {
+                directTabPreviewInFlight = false;
+                directTabHasQueuedParameters = false;
+            }
+        }
+
+        private void CancelDirectTabAutoPreview(bool resetQueuedState = true)
+        {
+            directTabPreviewPending = false;
+            directTabPreviewInFlight = false;
+            directTabNextPreviewTime = 0d;
+
+            if (resetQueuedState)
+            {
+                directTabHasQueuedParameters = false;
+                directTabQueuedParameterState = default;
+            }
+        }
+
+        private DirectPreviewParameterState CaptureCurrentDirectPreviewState()
+        {
+            return new DirectPreviewParameterState(
+                adjustmentIntensity,
+                preserveLuminance,
+                preserveTexture,
+                adjustmentMode,
+                useDualColorSelection,
+                selectedTargetColor,
+                selectedReferenceColor,
+                hasSelectedTargetColor,
+                hasSelectedReferenceColor,
+                colorSelectionRange,
+                useHighPrecisionMode
+            );
+        }
+
+        private void HandleDirectMaterialSelectionChanged()
+        {
+            ClearPreview();
+
+            if (directTabAutoPreviewEnabled && realTimePreview && CanProcessExperimental())
+            {
+                RequestDirectTabAutoPreview(CaptureCurrentDirectPreviewState());
+            }
+        }
+
+        private bool IsHighPrecisionConfigValidForDirectTab()
+        {
+            if (highPrecisionConfig == null)
+            {
+                return false;
+            }
+
+            var referenceTexture = GetExperimentalReferenceTexture();
+            if (referenceTexture == null)
+            {
+                return false;
+            }
+
+            return HighPrecisionProcessor.ValidateHighPrecisionConfig(highPrecisionConfig, referenceTexture);
+        }
+
         private void DrawHeader()
         {
             GUILayout.Space(10);
@@ -282,11 +432,6 @@ namespace TexColAdjuster
             }
             EditorGUILayout.EndHorizontal();
             
-            GUILayout.Space(5);
-            
-            EditorGUILayout.LabelField(LocalizationManager.Get("window_subtitle"), EditorStyles.boldLabel);
-            GUILayout.Space(5);
-            EditorGUILayout.LabelField(LocalizationManager.Get("window_description"), EditorStyles.miniLabel);
             GUILayout.Space(10);
         }
         
@@ -296,10 +441,10 @@ namespace TexColAdjuster
             {
                 LocalizationManager.Get("tab_basic"),
                 LocalizationManager.Get("tab_direct"),
-                LocalizationManager.Get("tab_color_adjust"),
                 LocalizationManager.Get("tab_shader_settings")
             };
             
+            activeTab = Mathf.Clamp(activeTab, 0, localizedTabs.Length - 1);
             activeTab = GUILayout.Toolbar(activeTab, localizedTabs);
             GUILayout.Space(10);
         }
@@ -315,9 +460,6 @@ namespace TexColAdjuster
                     DrawDirectTab();
                     break;
                 case 2:
-                    DrawColorAdjustTab();
-                    break;
-                case 3:
                     DrawShaderSettingsTab();
                     break;
             }
@@ -375,32 +517,51 @@ namespace TexColAdjuster
             }
         }
         
-        private void DrawBasicTab()
+        private void DrawInputsResetControl()
         {
-            EditorGUILayout.LabelField(LocalizationManager.Get("texture_selection"), EditorStyles.boldLabel);
-            
-            // Reference texture
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(LocalizationManager.Get("reference_texture"), GUILayout.Width(200));
-            var newReferenceTexture = (Texture2D)EditorGUILayout.ObjectField(referenceTexture, typeof(Texture2D), false);
-            if (newReferenceTexture != referenceTexture)
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button(LocalizationManager.Get("reset_inputs"), GUILayout.Width(120)))
             {
-                referenceTexture = newReferenceTexture;
-                ClearPreview();
-                CheckForAutoPreview();
+                ResetInputsToInitialState();
             }
             EditorGUILayout.EndHorizontal();
+            GUILayout.Space(4f);
+        }
+
+        private void DrawBasicTab()
+        {
+            DrawInputsResetControl();
+            EditorGUILayout.LabelField(LocalizationManager.Get("texture_selection"), EditorStyles.boldLabel);
             
-            // Target texture
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(LocalizationManager.Get("target_texture"), GUILayout.Width(200));
-            var newTargetTexture = (Texture2D)EditorGUILayout.ObjectField(targetTexture, typeof(Texture2D), false);
+
+            EditorGUILayout.BeginVertical();
+            DrawTextureDropLabel("target_texture", targetTexture);
+            var newTargetTexture = (Texture2D)EditorGUILayout.ObjectField(targetTexture, typeof(Texture2D), false, GUILayout.MinWidth(160));
             if (newTargetTexture != targetTexture)
             {
                 targetTexture = newTargetTexture;
                 ClearPreview();
                 CheckForAutoPreview();
             }
+            EditorGUILayout.EndVertical();
+
+            GUILayout.Space(8);
+            GUILayout.Label("+", EditorStyles.boldLabel, GUILayout.Width(20));
+            GUILayout.Space(8);
+
+            EditorGUILayout.BeginVertical();
+            DrawTextureDropLabel("direct_reference_texture", referenceTexture);
+            var newReferenceTexture = (Texture2D)EditorGUILayout.ObjectField(referenceTexture, typeof(Texture2D), false, GUILayout.MinWidth(160));
+            if (newReferenceTexture != referenceTexture)
+            {
+                referenceTexture = newReferenceTexture;
+                ClearPreview();
+                CheckForAutoPreview();
+            }
+            EditorGUILayout.EndVertical();
+
             EditorGUILayout.EndHorizontal();
             
             GUILayout.Space(10);
@@ -605,38 +766,69 @@ namespace TexColAdjuster
             EditorGUILayout.HelpBox("💡 使い方: Hierarchyから色を変えたいGameObjectをドラッグ&ドロップしてください。\nメインカラーテクスチャ（_MainTex）が自動的に抽出され、色調整が行われます。", MessageType.Info);
             GUILayout.Space(10);
             
+            DrawInputsResetControl();
             EditorGUILayout.LabelField(LocalizationManager.Get("texture_selection"), EditorStyles.boldLabel);
             
-            // Reference component/texture selection
+            // Target and reference GameObject selection
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(LocalizationManager.Get("reference_texture"), GUILayout.Width(200));
-            var newReferenceGameObject = EditorGUILayout.ObjectField(
-                referenceGameObject, 
-                typeof(GameObject), 
-                true
+
+            EditorGUILayout.BeginVertical();
+            DrawDropAreaLabel("direct_target_texture", targetGameObject, selectedTargetMaterial);
+            var newTargetGameObject = EditorGUILayout.ObjectField(
+                targetGameObject,
+                typeof(GameObject),
+                true,
+                GUILayout.MinWidth(160)
             ) as GameObject;
-            
+
+            if (newTargetGameObject != targetGameObject)
+            {
+                targetGameObject = newTargetGameObject;
+                targetComponent = GetRendererComponent(targetGameObject);
+                selectedTargetMaterial = null; // Reset material selection
+
+                if (previewTexture != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(previewTexture, true);
+                    previewTexture = null;
+                }
+
+                CheckForExperimentalAutoPreview();
+                UpdateCurrentMeshInfo();
+            }
+            EditorGUILayout.EndVertical();
+
+            GUILayout.Space(8);
+            GUILayout.Label("+", EditorStyles.boldLabel, GUILayout.Width(20));
+            GUILayout.Space(8);
+
+            EditorGUILayout.BeginVertical();
+            DrawDropAreaLabel("direct_reference_texture", referenceGameObject, selectedReferenceMaterial);
+            var newReferenceGameObject = EditorGUILayout.ObjectField(
+                referenceGameObject,
+                typeof(GameObject),
+                true,
+                GUILayout.MinWidth(160)
+            ) as GameObject;
+
             if (newReferenceGameObject != referenceGameObject)
             {
                 referenceGameObject = newReferenceGameObject;
                 referenceComponent = GetRendererComponent(referenceGameObject);
                 selectedReferenceMaterial = null; // Reset material selection
-                
-                // Update high precision config to use the reference GameObject
+
                 if (highPrecisionConfig != null)
                 {
                     highPrecisionConfig.referenceGameObject = newReferenceGameObject;
                     ClearPreview();
                     uvUsageStats = "";
-                    
-                    // Update UV mask preview if high precision mode is enabled
+
                     if (useHighPrecisionMode)
                     {
                         GenerateUVMaskPreview();
                     }
                 }
-                
-                // Clear existing preview when component changes
+
                 if (previewTexture != null)
                 {
                     UnityEngine.Object.DestroyImmediate(previewTexture, true);
@@ -645,38 +837,44 @@ namespace TexColAdjuster
                 CheckForExperimentalAutoPreview();
                 UpdateCurrentMeshInfo();
             }
+            EditorGUILayout.EndVertical();
+
             EditorGUILayout.EndHorizontal();
             
-            if (referenceGameObject == null)
+            GUILayout.Space(10);
+
+            if (referenceGameObject == null || targetGameObject == null)
             {
                 EditorGUILayout.HelpBox("Skinned Mesh RendererまたはMesh Rendererを持つGameObjectを選択してください", MessageType.Info);
             }
-            else if (referenceComponent == null)
+
+            if (referenceGameObject != null)
             {
-                EditorGUILayout.HelpBox("選択されたGameObjectにSkinned Mesh RendererまたはMesh Rendererが見つかりません", MessageType.Warning);
-            }
-            else
-            {
-                // Show detected component info
-                EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField("検出されたコンポーネント:", GUILayout.Width(140));
-                EditorGUILayout.LabelField(referenceComponent.GetType().Name, EditorStyles.miniLabel);
-                EditorGUILayout.EndHorizontal();
-                
-                // Show material selection for reference component
-                var oldReferenceMaterial = selectedReferenceMaterial;
-                DrawMaterialSelectionForComponent(referenceComponent, "参照用", ref selectedReferenceMaterial);
-                
-                // Check if reference material changed and update UV mask preview
-                if (oldReferenceMaterial != selectedReferenceMaterial && useHighPrecisionMode)
+                if (referenceComponent == null)
                 {
-                    GenerateUVMaskPreview();
+                    EditorGUILayout.HelpBox("選択されたGameObjectにSkinned Mesh RendererまたはMesh Rendererが見つかりません", MessageType.Warning);
+                }
+                else
+                {
+                    // Show detected component info
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField("検出されたコンポーネント:", GUILayout.Width(140));
+                    EditorGUILayout.LabelField(referenceComponent.GetType().Name, EditorStyles.miniLabel);
+                    EditorGUILayout.EndHorizontal();
+
+                    // Show material selection for reference component
+                    var oldReferenceMaterial = selectedReferenceMaterial;
+                    DrawMaterialSelectionForComponent(referenceComponent, "参照用", ref selectedReferenceMaterial);
+
+                    // Check if reference material changed and update UV mask preview
+                    if (oldReferenceMaterial != selectedReferenceMaterial && useHighPrecisionMode)
+                    {
+                        GenerateUVMaskPreview();
+                    }
                 }
             }
             
-            // High-precision mode section - placed after texture/material selection
-            GUILayout.Space(10);
-            DrawHighPrecisionModeForDirectTab();
+            // High-precision mode section removed per design update
             
             // Dual color selection mode
             if (GetExperimentalReferenceTexture() != null && GetExperimentalTargetTexture() != null)
@@ -700,49 +898,23 @@ namespace TexColAdjuster
             GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
             
-            // Target component/texture selection
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(LocalizationManager.Get("target_texture"), GUILayout.Width(200));
-            var newTargetGameObject = EditorGUILayout.ObjectField(
-                targetGameObject, 
-                typeof(GameObject), 
-                true
-            ) as GameObject;
-            
-            if (newTargetGameObject != targetGameObject)
+            if (targetGameObject != null)
             {
-                targetGameObject = newTargetGameObject;
-                targetComponent = GetRendererComponent(targetGameObject);
-                selectedTargetMaterial = null; // Reset material selection
-                // Clear existing preview when component changes
-                if (previewTexture != null)
+                if (targetComponent == null)
                 {
-                    UnityEngine.Object.DestroyImmediate(previewTexture, true);
-                    previewTexture = null;
+                    EditorGUILayout.HelpBox("選択されたGameObjectにSkinned Mesh RendererまたはMesh Rendererが見つかりません", MessageType.Warning);
                 }
-                CheckForExperimentalAutoPreview();
-                UpdateCurrentMeshInfo();
-            }
-            EditorGUILayout.EndHorizontal();
-            
-            if (targetGameObject == null)
-            {
-                EditorGUILayout.HelpBox("Skinned Mesh RendererまたはMesh Rendererを持つGameObjectを選択してください", MessageType.Info);
-            }
-            else if (targetComponent == null)
-            {
-                EditorGUILayout.HelpBox("選択されたGameObjectにSkinned Mesh RendererまたはMesh Rendererが見つかりません", MessageType.Warning);
-            }
-            else
-            {
-                // Show detected component info
-                EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField("検出されたコンポーネント:", GUILayout.Width(140));
-                EditorGUILayout.LabelField(targetComponent.GetType().Name, EditorStyles.miniLabel);
-                EditorGUILayout.EndHorizontal();
-                
-                // Show material selection for target component
-                DrawMaterialSelectionForComponent(targetComponent, "変更対象", ref selectedTargetMaterial);
+                else
+                {
+                    // Show detected component info
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField("検出されたコンポーネント:", GUILayout.Width(140));
+                    EditorGUILayout.LabelField(targetComponent.GetType().Name, EditorStyles.miniLabel);
+                    EditorGUILayout.EndHorizontal();
+
+                    // Show material selection for target component
+                    DrawMaterialSelectionForComponent(targetComponent, "変更対象", ref selectedTargetMaterial);
+                }
             }
             
             // Visual flow indicator for result
@@ -857,21 +1029,52 @@ namespace TexColAdjuster
                 GUILayout.Space(10);
             }
             
+            DrawNDMFOptionsForDirectTab();
+            
             // Preview controls
             EditorGUILayout.LabelField(LocalizationManager.Get("preview"), EditorStyles.boldLabel);
             
             EditorGUILayout.BeginHorizontal();
             showPreview = EditorGUILayout.Toggle(LocalizationManager.Get("show_preview"), showPreview);
-            realTimePreview = EditorGUILayout.Toggle(LocalizationManager.Get("realtime_preview"), realTimePreview);
+            bool autoPreviewToggle = EditorGUILayout.Toggle(LocalizationManager.Get("direct_auto_preview"), directTabAutoPreviewEnabled);
+            if (autoPreviewToggle != directTabAutoPreviewEnabled)
+            {
+                directTabAutoPreviewEnabled = autoPreviewToggle;
+                if (!directTabAutoPreviewEnabled)
+                {
+                    CancelDirectTabAutoPreview();
+                }
+                else if (realTimePreview && CanProcessExperimental())
+                {
+                    RequestDirectTabAutoPreview(CaptureCurrentDirectPreviewState());
+                }
+            }
             EditorGUILayout.EndHorizontal();
             
             EditorGUILayout.BeginHorizontal();
+            bool previousRealTimePreview = realTimePreview;
+            realTimePreview = EditorGUILayout.Toggle(LocalizationManager.Get("realtime_preview"), realTimePreview);
+            if (previousRealTimePreview != realTimePreview)
+            {
+                if (!realTimePreview)
+                {
+                    CancelDirectTabAutoPreview();
+                }
+                else if (directTabAutoPreviewEnabled && CanProcessExperimental())
+                {
+                    RequestDirectTabAutoPreview(CaptureCurrentDirectPreviewState());
+                }
+            }
             showMeshInfo = EditorGUILayout.Toggle("メッシュ情報を表示", showMeshInfo);
             EditorGUILayout.EndHorizontal();
             
-            if (realTimePreview)
+            if (realTimePreview && directTabAutoPreviewEnabled)
             {
                 EditorGUILayout.HelpBox("💡 動作が重い場合はリアルタイムプレビューをオフにしてください", MessageType.Info);
+            }
+            else if (CanProcessExperimental() && HasParametersChanged())
+            {
+                EditorGUILayout.HelpBox(LocalizationManager.Get("direct_manual_preview_hint"), MessageType.Info);
             }
             
             if (showPreview && GetExperimentalTargetTexture() != null)
@@ -921,20 +1124,125 @@ namespace TexColAdjuster
         private void DrawActionButtons()
         {
             EditorGUILayout.BeginHorizontal();
+            float buttonHeight = EditorGUIUtility.singleLineHeight * 1.5f;
             
             GUI.enabled = CanProcess();
-            if (GUILayout.Button(LocalizationManager.Get("generate_preview")))
+            if (GUILayout.Button(LocalizationManager.Get("generate_preview"), GUILayout.Height(buttonHeight)))
             {
                 GeneratePreview();
             }
             
-            if (GUILayout.Button(LocalizationManager.Get("apply_adjustment")))
+            if (GUILayout.Button(LocalizationManager.Get("apply_adjustment"), GUILayout.Height(buttonHeight)))
             {
                 ApplyAdjustment();
             }
             GUI.enabled = true;
             
             EditorGUILayout.EndHorizontal();
+        }
+
+        private void ApplyNDMFToSelectedMaterial()
+        {
+            if (!CanProcessExperimental())
+                return;
+
+            if (selectedTargetMaterial == null)
+            {
+                EditorUtility.DisplayDialog("エラー", "変更対象マテリアルを選択してください。", "OK");
+                return;
+            }
+
+            var referenceTexture = GetExperimentalReferenceTexture();
+            if (referenceTexture == null)
+            {
+                EditorUtility.DisplayDialog("エラー", "参照マテリアルからメインテクスチャを取得できませんでした。", "OK");
+                return;
+            }
+
+            var renderer = targetComponent as Renderer;
+            if (renderer == null)
+            {
+                EditorUtility.DisplayDialog("エラー", "選択されたコンポーネントはRendererではありません。", "OK");
+                return;
+            }
+
+            int materialSlot = NDMFIntegrationHelper.FindMaterialSlotWithMaterial(renderer, selectedTargetMaterial);
+            bool dualSelectionActive = useDualColorSelection && hasSelectedTargetColor && hasSelectedReferenceColor;
+            bool highPrecisionActive = useHighPrecisionMode && IsHighPrecisionConfigValidForDirectTab();
+
+            var component = NDMFIntegrationHelper.AddOrUpdateComponent(
+                renderer,
+                materialSlot,
+                referenceTexture,
+                adjustmentMode,
+                adjustmentIntensity,
+                preserveLuminance,
+                dualSelectionActive,
+                selectedTargetColor,
+                selectedReferenceColor,
+                colorSelectionRange,
+                0f,
+                1f,
+                1f,
+                1f,
+                highPrecisionActive,
+                highPrecisionActive ? highPrecisionConfig.referenceGameObject : null,
+                highPrecisionConfig.materialIndex,
+                highPrecisionConfig.uvChannel,
+                highPrecisionConfig.dominantColorCount,
+                highPrecisionConfig.useWeightedSampling);
+
+            if (component != null)
+            {
+                EditorUtility.DisplayDialog("完了", $"NDMFコンポーネントを '{renderer.gameObject.name}' に設定しました。", "OK");
+                Selection.activeObject = component;
+                EditorGUIUtility.PingObject(component);
+            }
+        }
+
+        private void ApplyNDMFToAvatarRoot()
+        {
+            if (!CanProcessExperimental())
+                return;
+
+            if (targetGameObject == null || selectedTargetMaterial == null)
+            {
+                EditorUtility.DisplayDialog("エラー", "NDMF適用には対象GameObjectとマテリアルの選択が必要です。", "OK");
+                return;
+            }
+
+            var referenceTexture = GetExperimentalReferenceTexture();
+            if (referenceTexture == null)
+            {
+                EditorUtility.DisplayDialog("エラー", "参照マテリアルからメインテクスチャを取得できませんでした。", "OK");
+                return;
+            }
+
+            bool dualSelectionActive = useDualColorSelection && hasSelectedTargetColor && hasSelectedReferenceColor;
+            bool highPrecisionActive = useHighPrecisionMode && IsHighPrecisionConfigValidForDirectTab();
+
+            NDMFIntegrationHelper.AddNDMFComponentsUnderAvatarRoot(
+                targetGameObject,
+                selectedTargetMaterial,
+                referenceTexture,
+                adjustmentMode,
+                adjustmentIntensity,
+                preserveLuminance,
+                dualSelectionActive,
+                selectedTargetColor,
+                selectedReferenceColor,
+                colorSelectionRange,
+                0f,
+                1f,
+                1f,
+                1f,
+                highPrecisionActive,
+                highPrecisionActive ? highPrecisionConfig.referenceGameObject : null,
+                highPrecisionConfig.materialIndex,
+                highPrecisionConfig.uvChannel,
+                highPrecisionConfig.dominantColorCount,
+                highPrecisionConfig.useWeightedSampling,
+                includeInactiveObjects);
         }
         
         private void CheckForAutoPreview()
@@ -976,6 +1284,28 @@ namespace TexColAdjuster
             EditorGUILayout.LabelField(LocalizationManager.Get("adjustment_mode"), GUILayout.Width(200));
             colorAdjustmentMode = (ColorAdjustmentMode)EditorGUILayout.EnumPopup(colorAdjustmentMode);
             EditorGUILayout.EndHorizontal();
+        }
+        
+        private void DrawNDMFOptionsForDirectTab()
+        {
+            EditorGUILayout.LabelField("NDMF", GetLargeBoldLabelStyle());
+            EditorGUILayout.BeginVertical("box");
+            var largeToggleStyle = GetLargeToggleLabelStyle();
+            float toggleHeight = largeToggleStyle.fontSize + largeToggleStyle.padding.vertical + 6f;
+            bool newValue = EditorGUILayout.ToggleLeft(new GUIContent(LocalizationManager.Get("ndmf_toggle_label")), useNDMFDirectMode, largeToggleStyle, GUILayout.Height(toggleHeight));
+            if (newValue != useNDMFDirectMode)
+            {
+                useNDMFDirectMode = newValue;
+                NDMFIntegrationHelper.SetNDMFMode("Direct", useNDMFDirectMode);
+                Repaint();
+            }
+
+            if (useNDMFDirectMode)
+            {
+                EditorGUILayout.HelpBox(LocalizationManager.Get("ndmf_toggle_note"), MessageType.Info);
+                includeInactiveObjects = EditorGUILayout.Toggle("非アクティブも対象", includeInactiveObjects);
+            }
+            EditorGUILayout.EndVertical();
         }
         
         private void DrawSingleTextureColorControls()
@@ -1044,6 +1374,165 @@ namespace TexColAdjuster
                 singleTexturePreview = null;
             }
         }
+
+        private void ResetInputsToInitialState()
+        {
+            // Reset user-adjustable inputs back to the initial window state.
+            ClearPreview();
+            DisposeReadableTextureCaches();
+            ClearUVMaskPreview();
+            ResetSingleTextureAdjustments();
+
+            scrollPosition = Vector2.zero;
+            referenceTexture = null;
+            targetTexture = null;
+            transformConfig = new ColorTransformConfig();
+            selectedFromColor = new ColorPixel(255, 255, 255);
+            selectedToColor = new ColorPixel(255, 255, 255);
+            hasSelectedFromColor = false;
+            hasSelectedToColor = false;
+
+            showPreview = true;
+            realTimePreview = true;
+            directTabAutoPreviewEnabled = true;
+            directTabPreviewPending = false;
+            directTabPreviewInFlight = false;
+            directTabHasQueuedParameters = false;
+            directTabNextPreviewTime = 0d;
+            directTabQueuedParameterState = default;
+            isProcessing = false;
+            processingProgress = 0f;
+
+            selectionMask = null;
+            currentSelectionMode = SelectionMode.None;
+            hoverColor = Color.white;
+            lastClickPosition = Vector2Int.zero;
+            currentMeshInfo = null;
+            showMeshInfo = true;
+
+            useDualColorSelection = false;
+            selectedTargetColor = Color.white;
+            selectedReferenceColor = Color.white;
+            hoverTargetColor = Color.white;
+            hoverReferenceColor = Color.white;
+            hasSelectedTargetColor = false;
+            hasSelectedReferenceColor = false;
+            targetTextureScrollPosition = Vector2.zero;
+            referenceTextureScrollPosition = Vector2.zero;
+            colorSelectionRange = 1.0f;
+
+            singleTexture = null;
+            singleGammaAdjustment = 1.0f;
+            singleSaturationAdjustment = 1.0f;
+            singleBrightnessAdjustment = 1.0f;
+
+            adjustmentIntensity = 100f;
+            preserveLuminance = false;
+            preserveTexture = true;
+            adjustmentMode = ColorAdjustmentMode.LabHistogramMatching;
+
+            intensity = 100f;
+            colorAdjustmentMode = ColorAdjustmentMode.LabHistogramMatching;
+
+            useHighPrecisionMode = false;
+            lastDirectTabHighPrecisionState = false;
+            highPrecisionConfig = new HighPrecisionProcessor.HighPrecisionConfig();
+            uvUsageStats = "";
+
+            useNDMFDirectMode = NDMFIntegrationHelper.GetNDMFMode("Direct");
+
+            useBalanceMode = true;
+
+            lastTransformConfig = null;
+            lastFromColor = new ColorPixel(255, 255, 255);
+            lastToColor = new ColorPixel(255, 255, 255);
+            lastHasFromColor = false;
+            lastHasToColor = false;
+
+            lastAdjustmentIntensity = -1f;
+            lastPreserveLuminance = false;
+            lastPreserveTexture = true;
+            lastAdjustmentMode = ColorAdjustmentMode.LabHistogramMatching;
+            lastUseDualColorSelection = false;
+            lastSelectedTargetColor = Color.white;
+            lastSelectedReferenceColor = Color.white;
+            lastHasSelectedTargetColor = false;
+            lastHasSelectedReferenceColor = false;
+            lastColorSelectionRange = -1f;
+            lastUseHighPrecisionModeForPreview = false;
+
+            sourceLiltoonMaterial = null;
+            targetLiltoonMaterials?.Clear();
+
+            includeInactiveObjects = false;
+            shaderTransferTab = 0;
+            selectedCategories = MaterialUnifyToolMethods.TransferCategories.None;
+
+            transferReflectionCubeTex = false;
+            transferMatCapTex = false;
+            transferMatCapBumpMask = false;
+            transferMatCap2ndTex = false;
+            transferMatCap2ndBumpMask = false;
+
+            shaderTransferSourceGameObject = null;
+            shaderTransferTargetGameObjects?.Clear();
+            shaderTransferSourceAvailableMaterials?.Clear();
+            shaderTransferSelectedSourceMaterialIndex = -1;
+            shaderTransferTargetAvailableMaterials?.Clear();
+            shaderTransferTargetSelectedMaterials?.Clear();
+            shaderTransferSourceMaterialToGameObjects?.Clear();
+            shaderTransferTargetMaterialToGameObjects?.Clear();
+            shaderTransferSourceMaterialFoldouts?.Clear();
+            shaderTransferTargetMaterialFoldouts?.Clear();
+
+            referenceGameObject = null;
+            targetGameObject = null;
+            referenceComponent = null;
+            targetComponent = null;
+            selectedReferenceMaterial = null;
+            selectedTargetMaterial = null;
+
+            enableMaterialTransfer = false;
+            materialTransferDirection = 0;
+
+            balanceGameObject = null;
+            balanceRendererComponent = null;
+            balanceSelectedMaterial = null;
+            previousColor = Color.white;
+            newColor = Color.white;
+            balanceModeEnabled = true;
+            transparentModeEnabled = false;
+            balanceModeVersion = BalanceModeVersion.V1_Distance;
+
+            texturePreviewScrollPosition = Vector2.zero;
+            showTexturePreview = true;
+            v1Weight = 1.0f;
+            v1MinimumValue = 0.0f;
+            v2Weight = 1.0f;
+            v2Radius = 0.0f;
+            v2MinimumValue = 0.0f;
+            v2IncludeOutside = false;
+
+            v3GradientColor = Color.white;
+            v3GradientStart = 0f;
+            v3GradientEnd = 100f;
+
+            enableBrightness = false;
+            brightness = 1.0f;
+            enableContrast = false;
+            contrast = 1.0f;
+            enableGamma = false;
+            gamma = 1.0f;
+            enableExposure = false;
+            exposure = 0.0f;
+            enableTransparency = false;
+            transparency = 0.0f;
+
+            UpdateSmartColorMatchParameterCache();
+            UpdateParameterCache();
+
+            Repaint();
+        }
         
         private Color ApplyColorAdjustments(Color color)
         {
@@ -1094,6 +1583,7 @@ namespace TexColAdjuster
             
             isProcessing = true;
             processingProgress = 0f;
+            bool previewGenerated = false;
             
             try
             {
@@ -1198,6 +1688,7 @@ namespace TexColAdjuster
                 
                 processingProgress = 1f;
                 showPreview = true;
+                previewGenerated = previewTexture != null;
             }
             catch (Exception e)
             {
@@ -1208,6 +1699,12 @@ namespace TexColAdjuster
             {
                 isProcessing = false;
                 Repaint();
+
+                if (previewGenerated)
+                {
+                    UpdateParameterCache();
+                    directTabHasQueuedParameters = false;
+                }
             }
         }
         
@@ -1442,13 +1939,7 @@ namespace TexColAdjuster
                 if (selectedMaterial != newMaterial)
                 {
                     selectedMaterial = newMaterial;
-                    // Clear existing preview when material changes
-                    if (previewTexture != null)
-                    {
-                        UnityEngine.Object.DestroyImmediate(previewTexture, true);
-                        previewTexture = null;
-                    }
-                    // Check if both materials are now available for preview generation
+                    HandleDirectMaterialSelectionChanged();
                     CheckForExperimentalAutoPreview();
                 }
                 EditorGUILayout.BeginHorizontal();
@@ -1492,13 +1983,7 @@ namespace TexColAdjuster
                     if (selectedMaterial != newMaterial)
                     {
                         selectedMaterial = newMaterial;
-                        // Clear existing preview when material changes
-                        if (previewTexture != null)
-                        {
-                            UnityEngine.Object.DestroyImmediate(previewTexture, true);
-                            previewTexture = null;
-                        }
-                        // Check if both materials are now available for preview generation
+                        HandleDirectMaterialSelectionChanged();
                         CheckForExperimentalAutoPreview();
                     }
                 }
@@ -1507,13 +1992,7 @@ namespace TexColAdjuster
                 if (newIndex != selectedIndex && newIndex >= 0 && newIndex < materials.Length)
                 {
                     selectedMaterial = materials[newIndex];
-                    // Clear existing preview when material changes
-                    if (previewTexture != null)
-                    {
-                        UnityEngine.Object.DestroyImmediate(previewTexture, true);
-                        previewTexture = null;
-                    }
-                    // Check if both materials are now available for preview generation
+                    HandleDirectMaterialSelectionChanged();
                     CheckForExperimentalAutoPreview();
                 }
                 
@@ -1647,9 +2126,11 @@ namespace TexColAdjuster
         private void DrawDirectTabActionButtons()
         {
             EditorGUILayout.BeginHorizontal();
+            float actionButtonHeight = EditorGUIUtility.singleLineHeight * 2f;
             
-            GUI.enabled = CanProcessExperimental();
-            if (GUILayout.Button(LocalizationManager.Get("generate_preview")))
+            bool canProcess = CanProcessExperimental();
+            GUI.enabled = canProcess;
+            if (GUILayout.Button(LocalizationManager.Get("generate_preview"), GUILayout.Height(actionButtonHeight)))
             {
                 if (useHighPrecisionMode && GetExperimentalReferenceTexture() != null)
                 {
@@ -1661,20 +2142,137 @@ namespace TexColAdjuster
                 }
             }
             
-            if (GUILayout.Button(LocalizationManager.Get("apply_adjustment")))
+            if (useNDMFDirectMode)
             {
-                if (useHighPrecisionMode && GetExperimentalReferenceTexture() != null)
+                if (GUILayout.Button(LocalizationManager.Get("apply_to_parts"), GUILayout.Height(actionButtonHeight)))
                 {
-                    ApplyHighPrecisionAdjustmentForDirectTab();
+                    ApplyNDMFToSelectedMaterial();
                 }
-                else
+                GUI.enabled = canProcess;
+                if (GUILayout.Button(LocalizationManager.Get("ndmf_apply_all"), GUILayout.Height(actionButtonHeight)))
                 {
-                    ExecuteExperimentalColorAdjustment();
+                    ApplyNDMFToAvatarRoot();
+                }
+            }
+            else
+            {
+                if (GUILayout.Button(LocalizationManager.Get("apply_adjustment"), GUILayout.Height(actionButtonHeight)))
+                {
+                    if (useHighPrecisionMode && GetExperimentalReferenceTexture() != null)
+                    {
+                        ApplyHighPrecisionAdjustmentForDirectTab();
+                    }
+                    else
+                    {
+                        ExecuteExperimentalColorAdjustment();
+                    }
                 }
             }
             GUI.enabled = true;
             
             EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawDropAreaLabel(string localizationKey, GameObject assignedGameObject, Material selectedMaterial)
+        {
+            Color previousContentColor = GUI.contentColor;
+
+            if (assignedGameObject == null)
+            {
+                GUI.contentColor = DropLabelMissingColor;
+            }
+            else if (HasReadableMainTexture(assignedGameObject, selectedMaterial))
+            {
+                GUI.contentColor = DropLabelReadyColor;
+            }
+
+            EditorGUILayout.LabelField(LocalizationManager.Get(localizationKey), GetLargeBoldLabelStyle());
+            GUI.contentColor = previousContentColor;
+        }
+
+        private void DrawTextureDropLabel(string localizationKey, Texture2D texture)
+        {
+            var previousContentColor = GUI.contentColor;
+            GUI.contentColor = texture == null ? DropLabelMissingColor : DropLabelReadyColor;
+            EditorGUILayout.LabelField(LocalizationManager.Get(localizationKey), GetLargeBoldLabelStyle());
+            GUI.contentColor = previousContentColor;
+        }
+
+        // Lazily create a 150% sized bold label for key headings.
+        private GUIStyle GetLargeBoldLabelStyle()
+        {
+            if (largeBoldLabelStyle == null)
+            {
+                largeBoldLabelStyle = CreateScaledStyle(EditorStyles.boldLabel, 1.5f, FontStyle.Bold);
+            }
+
+            return largeBoldLabelStyle;
+        }
+
+        // Lazily create a 150% sized label used for prominent toggles.
+        private GUIStyle GetLargeToggleLabelStyle()
+        {
+            if (largeToggleLabelStyle == null)
+            {
+                largeToggleLabelStyle = CreateScaledStyle(EditorStyles.label, 1.5f, null);
+                largeToggleLabelStyle.alignment = TextAnchor.MiddleLeft;
+            }
+
+            return largeToggleLabelStyle;
+        }
+
+        private GUIStyle CreateScaledStyle(GUIStyle baseStyle, float scale, FontStyle? overrideFontStyle)
+        {
+            var style = new GUIStyle(baseStyle);
+
+            int baseSize = baseStyle.fontSize;
+            if (baseSize <= 0)
+            {
+                baseSize = EditorStyles.label.fontSize;
+            }
+
+            if (baseSize <= 0)
+            {
+                baseSize = 12;
+            }
+
+            style.fontSize = Mathf.RoundToInt(baseSize * scale);
+            if (style.fontSize <= 0)
+            {
+                style.fontSize = Mathf.RoundToInt(12 * scale);
+            }
+
+            if (overrideFontStyle.HasValue)
+            {
+                style.fontStyle = overrideFontStyle.Value;
+            }
+
+            return style;
+        }
+
+        private bool HasReadableMainTexture(GameObject gameObject, Material selectedMaterial)
+        {
+            if (gameObject == null)
+                return false;
+
+            if (selectedMaterial != null && GetMainTexture(selectedMaterial) != null)
+                return true;
+
+            var component = GetRendererComponent(gameObject);
+            if (component == null)
+                return false;
+
+            var materials = ExtractMaterials(component);
+            if (materials == null || materials.Length == 0)
+                return false;
+
+            foreach (var material in materials)
+            {
+                if (material != null && GetMainTexture(material) != null)
+                    return true;
+            }
+
+            return false;
         }
         
         private void DrawExperimentalActionButtons()
@@ -1891,15 +2489,17 @@ namespace TexColAdjuster
         
         private bool HasParametersChanged()
         {
-            return lastAdjustmentIntensity != adjustmentIntensity ||
-                   lastPreserveLuminance != preserveLuminance ||
-                   lastPreserveTexture != preserveTexture ||
+             return !Mathf.Approximately(lastAdjustmentIntensity, adjustmentIntensity) ||
+                 lastPreserveLuminance != preserveLuminance ||
+                 lastPreserveTexture != preserveTexture ||
                    lastAdjustmentMode != adjustmentMode ||
                    lastUseDualColorSelection != useDualColorSelection ||
                    lastSelectedTargetColor != selectedTargetColor ||
                    lastSelectedReferenceColor != selectedReferenceColor ||
                    lastHasSelectedTargetColor != hasSelectedTargetColor ||
-                   lastHasSelectedReferenceColor != hasSelectedReferenceColor;
+                 lastHasSelectedReferenceColor != hasSelectedReferenceColor ||
+                 !Mathf.Approximately(lastColorSelectionRange, colorSelectionRange) ||
+                 lastUseHighPrecisionModeForPreview != useHighPrecisionMode;
         }
         
         private void UpdateParameterCache()
@@ -1913,6 +2513,88 @@ namespace TexColAdjuster
             lastSelectedReferenceColor = selectedReferenceColor;
             lastHasSelectedTargetColor = hasSelectedTargetColor;
             lastHasSelectedReferenceColor = hasSelectedReferenceColor;
+            lastColorSelectionRange = colorSelectionRange;
+            lastUseHighPrecisionModeForPreview = useHighPrecisionMode;
+        }
+
+        private readonly struct DirectPreviewParameterState : IEquatable<DirectPreviewParameterState>
+        {
+            public readonly float Intensity;
+            public readonly bool PreserveLuminance;
+            public readonly bool PreserveTexture;
+            public readonly ColorAdjustmentMode Mode;
+            public readonly bool DualColorSelection;
+            public readonly Color TargetColor;
+            public readonly Color ReferenceColor;
+            public readonly bool HasTargetColor;
+            public readonly bool HasReferenceColor;
+            public readonly float SelectionRange;
+            public readonly bool HighPrecision;
+
+            public DirectPreviewParameterState(
+                float intensity,
+                bool preserveLuminance,
+                bool preserveTexture,
+                ColorAdjustmentMode mode,
+                bool dualColorSelection,
+                Color targetColor,
+                Color referenceColor,
+                bool hasTargetColor,
+                bool hasReferenceColor,
+                float selectionRange,
+                bool highPrecision)
+            {
+                Intensity = intensity;
+                PreserveLuminance = preserveLuminance;
+                PreserveTexture = preserveTexture;
+                Mode = mode;
+                DualColorSelection = dualColorSelection;
+                TargetColor = targetColor;
+                ReferenceColor = referenceColor;
+                HasTargetColor = hasTargetColor;
+                HasReferenceColor = hasReferenceColor;
+                SelectionRange = selectionRange;
+                HighPrecision = highPrecision;
+            }
+
+            public bool Equals(DirectPreviewParameterState other)
+            {
+                return Mathf.Approximately(Intensity, other.Intensity) &&
+                       PreserveLuminance == other.PreserveLuminance &&
+                       PreserveTexture == other.PreserveTexture &&
+                       Mode == other.Mode &&
+                       DualColorSelection == other.DualColorSelection &&
+                       TargetColor.Equals(other.TargetColor) &&
+                       ReferenceColor.Equals(other.ReferenceColor) &&
+                       HasTargetColor == other.HasTargetColor &&
+                       HasReferenceColor == other.HasReferenceColor &&
+                       Mathf.Approximately(SelectionRange, other.SelectionRange) &&
+                       HighPrecision == other.HighPrecision;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is DirectPreviewParameterState other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = Intensity.GetHashCode();
+                    hash = (hash * 397) ^ PreserveLuminance.GetHashCode();
+                    hash = (hash * 397) ^ PreserveTexture.GetHashCode();
+                    hash = (hash * 397) ^ (int)Mode;
+                    hash = (hash * 397) ^ DualColorSelection.GetHashCode();
+                    hash = (hash * 397) ^ TargetColor.GetHashCode();
+                    hash = (hash * 397) ^ ReferenceColor.GetHashCode();
+                    hash = (hash * 397) ^ HasTargetColor.GetHashCode();
+                    hash = (hash * 397) ^ HasReferenceColor.GetHashCode();
+                    hash = (hash * 397) ^ SelectionRange.GetHashCode();
+                    hash = (hash * 397) ^ HighPrecision.GetHashCode();
+                    return hash;
+                }
+            }
         }
         
         private Vector2Int CalculatePreviewSize(int width, int height, int maxSize)
@@ -2015,6 +2697,41 @@ namespace TexColAdjuster
             DrawDualColorPreview();
         }
         
+        private Texture2D GetReadableTextureForPicking(Texture2D source, ref Texture2D cache, ref Texture2D cachedSource)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            if (cache != null && cachedSource == source)
+            {
+                return cache;
+            }
+
+            DisposeCachedTexture(ref cache, ref cachedSource);
+
+            cachedSource = source;
+            cache = TextureProcessor.MakeTextureReadable(source);
+            return cache;
+        }
+
+        private void DisposeReadableTextureCaches()
+        {
+            DisposeCachedTexture(ref cachedTargetReadableForPicking, ref cachedTargetReadableSource);
+            DisposeCachedTexture(ref cachedReferenceReadableForPicking, ref cachedReferenceReadableSource);
+        }
+
+        private static void DisposeCachedTexture(ref Texture2D cache, ref Texture2D cachedSource)
+        {
+            if (cache != null)
+            {
+                UnityEngine.Object.DestroyImmediate(cache, true);
+                cache = null;
+            }
+            cachedSource = null;
+        }
+
         private void HandleTargetTextureInput(Rect textureRect)
         {
             Event currentEvent = Event.current;
@@ -2041,7 +2758,10 @@ namespace TexColAdjuster
                 // Get color at pixel
                 try
                 {
-                    var readableTexture = TextureProcessor.MakeTextureReadable(targetTexture);
+                    var readableTexture = GetReadableTextureForPicking(targetTexture, ref cachedTargetReadableForPicking, ref cachedTargetReadableSource);
+                    if (readableTexture == null)
+                        return;
+
                     hoverTargetColor = readableTexture.GetPixel(pixelX, pixelY);
                     
                     // Change cursor to eyedropper
@@ -2095,7 +2815,9 @@ namespace TexColAdjuster
                 // Get color at pixel
                 try
                 {
-                    var readableTexture = TextureProcessor.MakeTextureReadable(referenceTexture);
+                    var readableTexture = GetReadableTextureForPicking(referenceTexture, ref cachedReferenceReadableForPicking, ref cachedReferenceReadableSource);
+                    if (readableTexture == null && !(useHighPrecisionMode && highPrecisionConfig != null && highPrecisionConfig.referenceGameObject != null))
+                        return;
                     
                     // Use high precision mode color extraction if enabled
                     if (useHighPrecisionMode && highPrecisionConfig != null && highPrecisionConfig.referenceGameObject != null)
@@ -2103,7 +2825,7 @@ namespace TexColAdjuster
                         hoverReferenceColor = HighPrecisionProcessor.ExtractHighPrecisionTargetColor(
                             referenceTexture, highPrecisionConfig, uv);
                     }
-                    else
+                    else if (readableTexture != null)
                     {
                         hoverReferenceColor = readableTexture.GetPixel(pixelX, pixelY);
                     }
@@ -2911,6 +3633,7 @@ namespace TexColAdjuster
             
             isProcessing = true;
             processingProgress = 0f;
+            bool previewGenerated = false;
             
             try
             {
@@ -2934,6 +3657,7 @@ namespace TexColAdjuster
                 
                 processingProgress = 1f;
                 showPreview = true;
+                previewGenerated = previewTexture != null;
                 
                 if (previewTexture == null)
                 {
@@ -2949,6 +3673,12 @@ namespace TexColAdjuster
             {
                 isProcessing = false;
                 Repaint();
+
+                if (previewGenerated)
+                {
+                    UpdateParameterCache();
+                    directTabHasQueuedParameters = false;
+                }
             }
         }
         
@@ -4044,13 +4774,6 @@ namespace TexColAdjuster
             {
                 currentTexture = GetExperimentalTargetTexture();
             }
-            else if (activeTab == 2) // Color Adjust (Balance) tab
-            {
-                if (balanceSelectedMaterial != null)
-                {
-                    currentTexture = GetMainTexture(balanceSelectedMaterial);
-                }
-            }
             
             if (currentTexture != null)
             {
@@ -4088,6 +4811,16 @@ namespace TexColAdjuster
                 highPrecisionPreviewTexture = null;
             }
             
+            CancelDirectTabAutoPreview();
+            DisposeReadableTextureCaches();
+            lastAdjustmentIntensity = float.NaN;
+            lastColorSelectionRange = -1f;
+            lastUseHighPrecisionModeForPreview = !useHighPrecisionMode;
+            directTabHasQueuedParameters = false;
+            directTabPreviewPending = false;
+            directTabPreviewInFlight = false;
+            directTabQueuedParameterState = default;
+            
             ClearUVMaskPreview();
         }
         
@@ -4100,21 +4833,15 @@ namespace TexColAdjuster
             
             EditorGUILayout.BeginVertical("box");
             
-            // High-precision mode toggle with UV mask preview
-            EditorGUILayout.BeginHorizontal();
-            
-            bool newUseHighPrecision = EditorGUILayout.Toggle("高精度モードを使用", useHighPrecisionMode);
-            if (newUseHighPrecision != useHighPrecisionMode)
+            if (useHighPrecisionMode != lastDirectTabHighPrecisionState)
             {
-                useHighPrecisionMode = newUseHighPrecision;
+                lastDirectTabHighPrecisionState = useHighPrecisionMode;
                 ClearPreview();
                 uvUsageStats = "";
-                
-                // Generate UV mask preview when toggling on
+
                 if (useHighPrecisionMode)
                 {
                     GenerateUVMaskPreview();
-                    // Generate high precision preview texture for eyedropper
                     if (referenceTexture != null && highPrecisionConfig != null && highPrecisionConfig.referenceGameObject != null)
                     {
                         if (highPrecisionPreviewTexture != null)
@@ -4135,19 +4862,19 @@ namespace TexColAdjuster
                     }
                 }
             }
-            
-            // Display UV mask preview if available
+
             if (useHighPrecisionMode && uvMaskPreviewTexture != null)
             {
+                EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
                 EditorGUILayout.BeginVertical();
                 EditorGUILayout.LabelField("UV使用領域プレビュー", EditorStyles.centeredGreyMiniLabel);
                 GUILayout.Label(uvMaskPreviewTexture, GUILayout.Width(128), GUILayout.Height(128));
                 EditorGUILayout.LabelField("灰色部分: 未使用領域", EditorStyles.centeredGreyMiniLabel);
                 EditorGUILayout.EndVertical();
+                GUILayout.FlexibleSpace();
+                EditorGUILayout.EndHorizontal();
             }
-            
-            EditorGUILayout.EndHorizontal();
             
             if (useHighPrecisionMode)
             {
@@ -4394,6 +5121,7 @@ namespace TexColAdjuster
             
             isProcessing = true;
             processingProgress = 0f;
+            bool previewGenerated = false;
             
             try
             {
@@ -4409,6 +5137,7 @@ namespace TexColAdjuster
                 
                 processingProgress = 1f;
                 showPreview = true;
+                previewGenerated = previewTexture != null;
                 
                 if (previewTexture == null)
                 {
@@ -4424,6 +5153,12 @@ namespace TexColAdjuster
             {
                 isProcessing = false;
                 Repaint();
+
+                if (previewGenerated)
+                {
+                    UpdateParameterCache();
+                    directTabHasQueuedParameters = false;
+                }
             }
         }
         
@@ -5351,11 +6086,5 @@ namespace TexColAdjuster
         }
     }
     
-    public enum ColorAdjustmentMode
-    {
-        LabHistogramMatching,
-        HueShift,
-        ColorTransfer,
-        AdaptiveAdjustment
-    }
 }
+
