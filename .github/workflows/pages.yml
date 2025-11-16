@@ -29,8 +29,8 @@ jobs:
       - name: Get package version from Packages directory
         id: version
         run: |
-          if [ -f "Packages/dev.nekoare.tex-col-adjuster/package.json" ]; then
-            VERSION=$(jq -r '.version' Packages/dev.nekoare.tex-col-adjuster/package.json)
+          if [ -f "Packages/dev.nekoare.tex-col-adjuster-test/package.json" ]; then
+            VERSION=$(jq -r '.version' Packages/dev.nekoare.tex-col-adjuster-test/package.json)
             echo "Found version in Packages: $VERSION"
           else
             VERSION="1.2"
@@ -46,7 +46,7 @@ jobs:
       - name: Create package ZIP file
         run: |
           echo "Preparing package.json for release (normalize SemVer, strip vpmDependencies)"
-          PKG_DIR="Packages/dev.nekoare.tex-col-adjuster"
+          PKG_DIR="Packages/dev.nekoare.tex-col-adjuster-test"
           PKG_JSON="$PKG_DIR/package.json"
           if [ -f "$PKG_JSON" ]; then
             tmp=$(mktemp)
@@ -67,17 +67,17 @@ jobs:
 
           echo "Creating ZIP from $PKG_DIR"
           cd "$PKG_DIR"
-          zip -r ../../dev.nekoare.tex-col-adjuster-v${{ steps.version.outputs.version }}.zip . \
+          zip -r ../../dev.nekoare.tex-col-adjuster-test-v${{ steps.version.outputs.version }}.zip . \
             -x "*.Zone.Identifier"
           cd ../..
-          echo "Created ZIP file: dev.nekoare.tex-col-adjuster-v${{ steps.version.outputs.version }}.zip"
+          echo "Created ZIP file: dev.nekoare.tex-col-adjuster-test-v${{ steps.version.outputs.version }}.zip"
           
       - name: Calculate ZIP hash and update index.json
         run: |
-          ZIP_NAME="dev.nekoare.tex-col-adjuster-v${{ steps.version.outputs.version }}.zip"
+          ZIP_NAME="dev.nekoare.tex-col-adjuster-test-v${{ steps.version.outputs.version }}.zip"
           ZIP_HASH=$(sha256sum "$ZIP_NAME" | cut -d' ' -f1)
           echo "Generated ZIP hash for v${{ steps.version.outputs.version }}: $ZIP_HASH"
-          
+
           # Validate that index.json exists and is valid
           if ! jq empty index.json; then
             echo "ERROR: index.json is not valid JSON"
@@ -86,16 +86,16 @@ jobs:
 
           # 旧キー "1.2" を削除（存在すれば）
           tmpfile=$(mktemp)
-          jq 'del(.packages["dev.nekoare.tex-col-adjuster"].versions["1.2"])' index.json > "$tmpfile" && mv "$tmpfile" index.json
-          
+          jq 'del(.packages["dev.nekoare.tex-col-adjuster-test"].versions["1.2"])' index.json > "$tmpfile" && mv "$tmpfile" index.json
+
           # Use jq to directly create and insert the new version entry
           jq \
             --arg version "${{ steps.version.outputs.version }}" \
             --arg hash "$ZIP_HASH" \
-            --arg url "https://nekoare.github.io/texture-color-adjuster/$ZIP_NAME" \
-            '.packages["dev.nekoare.tex-col-adjuster"].versions[$version] = {
-              "name": "dev.nekoare.tex-col-adjuster",
-              "displayName": "Texture Color Adjuster",
+            --arg url "https://nekoare.github.io/texture-color-adjuster-TEST/$ZIP_NAME" \
+            '.packages["dev.nekoare.tex-col-adjuster-test"].versions[$version] = {
+              "name": "dev.nekoare.tex-col-adjuster-test",
+              "displayName": "Texture Color Adjuster TEST",
               "version": $version,
               "description": "Unity Editor extension for advanced texture color adjustment with support for various color spaces and intelligent color manipulation algorithms.",
               "unity": "2022.3",
@@ -104,9 +104,9 @@ jobs:
                 "name": "nekoare",
                 "url": "https://github.com/nekoare"
               },
-              "changelogUrl": "https://github.com/nekoare/texture-color-adjuster/blob/main/CHANGELOG.md",
-              "documentationUrl": "https://github.com/nekoare/texture-color-adjuster/blob/main/README.md",
-              "licenseUrl": "https://github.com/nekoare/texture-color-adjuster/blob/main/LICENSE",
+              "changelogUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/CHANGELOG.md",
+              "documentationUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/README.md",
+              "licenseUrl": "https://github.com/nekoare/texture-color-adjuster-TEST/blob/main/LICENSE",
               "vpmDependencies": {},
               "keywords": [
                 "texture",
