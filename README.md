@@ -12,6 +12,7 @@ Texture Color Adjuster は、Unity Editor で高度なテクスチャ色調整�
 
 ## 📚 ドキュメント
 
+- **[GitHub Pagesセットアップ](GITHUB_PAGES_SETUP.md)** - ⚠️ 最初に必ずお読みください
 - **[アップデート手順](UPDATE_PROCEDURE.md)** - 詳細なアップデート手順
 - **[クイックチェックリスト](UPDATE_CHECKLIST.md)** - 簡易チェックリスト
 - **[スクリプト説明](scripts/README.md)** - 自動化スクリプトの使い方
